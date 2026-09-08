@@ -915,9 +915,14 @@ public class Qwen35TextModelInner: Module {
         _ inputs: MLXArray,
         cache: [KVCache?]? = nil,
         applyFinalNorm: Bool,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        layerTaps: [Int]? = nil,
+        capturedLayers: inout [MLXArray]?
     ) -> MLXArray {
-        if applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
+        // The fused decode schedule runs the whole step as one graph and never
+        // surfaces per-layer outputs, so a tap request has to take the general
+        // path. Single-token decode without taps is unaffected.
+        if applyFinalNorm, inputs.dim(1) == 1, layerTaps?.isEmpty ?? true, let caches = cache,
             let step = decodeStep(inputs, caches)
         {
             return step
@@ -933,6 +938,16 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
+        // Requested indices are resolved to positions once, so the loop stays a
+        // dictionary lookup rather than a search per layer.
+        var tapSlots: [Int: Int] = [:]
+        if let layerTaps, !layerTaps.isEmpty {
+            for (position, index) in layerTaps.enumerated() where layers.indices.contains(index) {
+                tapSlots[index] = position
+            }
+            capturedLayers = Array(repeating: MLXArray(), count: layerTaps.count)
+        }
+
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -941,9 +956,25 @@ public class Qwen35TextModelInner: Module {
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
                 checkpointAfter: checkpointAfter)
+            if let slot = tapSlots[i] {
+                capturedLayers?[slot] = hiddenStates
+            }
         }
 
         return applyFinalNorm ? norm(hiddenStates) : hiddenStates
+    }
+
+    /// Convenience overload for the callers that do not tap layers.
+    func forward(
+        _ inputs: MLXArray,
+        cache: [KVCache?]? = nil,
+        applyFinalNorm: Bool,
+        checkpointAfter: Int? = nil
+    ) -> MLXArray {
+        var ignored: [MLXArray]? = nil
+        return forward(
+            inputs, cache: cache, applyFinalNorm: applyFinalNorm,
+            checkpointAfter: checkpointAfter, layerTaps: nil, capturedLayers: &ignored)
     }
 
     // MARK: - Whole-step decode schedule
@@ -1092,11 +1123,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
+        let layerTaps = state?[mtpLayerTapIndicesKey]
+        var capturedLayers: [MLXArray]? = nil
         let hiddenStates: MLXArray
         if emitDrafterState {
             let hidden = model.forward(
                 input.tokens, cache: cache, applyFinalNorm: false,
-                checkpointAfter: state?[mtpCacheCheckpointIndexKey])
+                checkpointAfter: state?[mtpCacheCheckpointIndexKey],
+                layerTaps: layerTaps, capturedLayers: &capturedLayers)
             hiddenStates = model.norm(hidden)
         } else {
             hiddenStates = model(input.tokens, cache: cache)
@@ -1115,6 +1149,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         var outState = state ?? LMOutput.State()
         outState[mtpLastHiddenStatesKey] = hiddenStates
+        if let capturedLayers {
+            outState[mtpLayerHiddenStatesKey] = capturedLayers
+        }
         outState[mtpSharedKVStatesKey] = qwen35SharedKVState(
             cache: cache, fullAttentionIndex: model.faIdx)
         outState[mtpSharedKVOffsetsKey] = qwen35SharedKVOffsets(

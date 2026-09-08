@@ -297,6 +297,24 @@ public let mtpPositionDeltasKey =
 /// reads as `false` (no emit), so non-MTP callers are unaffected.
 public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
 
+/// Caller requests the target to also emit the hidden representation after
+/// each of these decoder layers, as zero-based indices into the backbone.
+///
+/// A single post-final-norm state (``mtpLastHiddenStatesKey``) is all a
+/// paired MTP head needs, but the drafter families that fuse several depths
+/// — EAGLE-3 mixes low/mid/high layers, block-diffusion heads read a fixed
+/// ladder — cannot be driven from it. Absent or empty means no capture, so
+/// the extra work only exists for callers that ask for it.
+public let mtpLayerTapIndicesKey =
+    LMOutput.Key<[Int]>("mtp.layerTapIndices")
+
+/// Target writes the requested per-layer hidden representations here, in the
+/// same order as ``mtpLayerTapIndicesKey``, each shaped `[B, L, H]`. These are
+/// the raw layer outputs — no final norm — because a fusing drafter owns its
+/// own normalization of the concatenated ladder.
+public let mtpLayerHiddenStatesKey =
+    LMOutput.Key<[MLXArray]>("mtp.layerHiddenStates")
+
 /// Requests a recurrent-cache checkpoint after this many verification input
 /// tokens. Hybrid Qwen models use `1` for MTP-1 so a rejected draft restores
 /// state after the always-committed bonus token without replaying the model.
