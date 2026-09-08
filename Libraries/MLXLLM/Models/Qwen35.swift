@@ -330,13 +330,14 @@ final class Qwen35GatedDeltaNet: Module {
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
         cache: MambaCache? = nil,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        captureSink: GatedDeltaRoundCaptureSink? = nil
     ) -> MLXArray {
         let convState =
             cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
         let (out, newConvState, newRecState, checkpoint) = forward(
             inputs, convState: convState, recState: cache?[1], mask: mask,
-            checkpointAfter: checkpointAfter)
+            checkpointAfter: checkpointAfter, captureSink: captureSink)
         if let cache {
             cache[0] = newConvState
             cache[1] = newRecState
@@ -368,7 +369,8 @@ final class Qwen35GatedDeltaNet: Module {
         convState: MLXArray,
         recState: MLXArray?,
         mask: MLXArray?,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        captureSink: GatedDeltaRoundCaptureSink? = nil
     ) -> (
         output: MLXArray,
         convState: MLXArray,
@@ -384,12 +386,17 @@ final class Qwen35GatedDeltaNet: Module {
             qkv = MLX.where(mask[.ellipsis, .newAxis], qkv, 0)
         }
 
+        // Every stash is behind the sink: a pass that does not ask for one
+        // allocates and concatenates nothing extra.
+        let capturedConvInput =
+            captureSink == nil ? nil : concatenated([convState, qkv], axis: 1)
+
         let fusedDecode =
             S == 1 && mask == nil && (qkv.dtype == .float16 || qkv.dtype == .bfloat16)
         let (convPre, newConvState) =
-            fusedDecode
+            fusedDecode && capturedConvInput == nil
             ? decodeConv(convState: convState, qkv: qkv)
-            : generalConv(convState: convState, qkv: qkv)
+            : generalConv(convState: convState, qkv: qkv, convInput: capturedConvInput)
         let convOut = silu(convPre)
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
@@ -405,6 +412,14 @@ final class Qwen35GatedDeltaNet: Module {
         let kNormed =
             MLXArray(invScale).asType(dtype)
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        if let captureSink, let capturedConvInput {
+            captureSink.append(
+                GatedDeltaRoundCapture(
+                    q: qNormed, k: kNormed, v: v, a: a, b: b,
+                    aLog: aLog, dtBias: dtBias, state: recState, mask: mask,
+                    convInput: capturedConvInput, convWindow: convKernelSize - 1))
+        }
 
         let out: MLXArray
         let newRecState: MLXArray
@@ -489,10 +504,13 @@ final class Qwen35GatedDeltaNet: Module {
 
     /// The sliding-window conv via MLX's `Convolution` kernel — the reference
     /// `decodeConv` is pinned against.
+    /// - Parameter convInput: `[pre-round window ‖ qkv]` when the caller already
+    ///   built it (a capturing round keeps it for rollback), so the concatenation
+    ///   happens once.
     func generalConv(
-        convState: MLXArray, qkv: MLXArray
+        convState: MLXArray, qkv: MLXArray, convInput: MLXArray? = nil
     ) -> (conv: MLXArray, state: MLXArray) {
-        let convInput = concatenated([convState, qkv], axis: 1)
+        let convInput = convInput ?? concatenated([convState, qkv], axis: 1)
         return (
             conv1d(convInput),
             contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
@@ -723,12 +741,14 @@ final class Qwen35DecoderLayer: Module {
         ssmMask: MLXArray?,
         cache: KVCache?,
         positionOffset: Int? = nil,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        captureSink: GatedDeltaRoundCaptureSink? = nil
     ) -> MLXArray {
         // Single-token unmasked decode runs the layer as one traced function
-        // (two for full attention, split at the KV write). Everything else
+        // (two for full attention, split at the KV write). Everything else —
+        // including a capturing round, whose stash the trace cannot surface —
         // takes the general body below.
-        if x.dim(1) == 1, ssmMask == nil {
+        if x.dim(1) == 1, ssmMask == nil, captureSink == nil {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
@@ -741,7 +761,7 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             r = linearAttn!(
                 inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
-                checkpointAfter: checkpointAfter)
+                checkpointAfter: checkpointAfter, captureSink: captureSink)
         } else {
             r = selfAttn!(
                 inputLayerNorm(x), mask: attentionMask, cache: cache,
@@ -852,7 +872,9 @@ final class Qwen35DecoderLayer: Module {
 // MARK: - Text Model
 
 public class Qwen35TextModelInner: Module {
-    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
+    /// Public because a drafter that reuses the target's embeddings - which is
+    /// what keeps a paired drafter small - has to reach them from its own module.
+    @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
     let norm: RMSNorm
@@ -917,12 +939,15 @@ public class Qwen35TextModelInner: Module {
         applyFinalNorm: Bool,
         checkpointAfter: Int? = nil,
         layerTaps: [Int]? = nil,
-        capturedLayers: inout [MLXArray]?
+        capturedLayers: inout [MLXArray]?,
+        captureSink: GatedDeltaRoundCaptureSink? = nil
     ) -> MLXArray {
         // The fused decode schedule runs the whole step as one graph and never
-        // surfaces per-layer outputs, so a tap request has to take the general
-        // path. Single-token decode without taps is unaffected.
-        if applyFinalNorm, inputs.dim(1) == 1, layerTaps?.isEmpty ?? true, let caches = cache,
+        // surfaces per-layer outputs or recurrence inputs, so a tap or capture
+        // request has to take the general path. Single-token decode without
+        // either is unaffected.
+        if applyFinalNorm, inputs.dim(1) == 1, layerTaps?.isEmpty ?? true, captureSink == nil,
+            let caches = cache,
             let step = decodeStep(inputs, caches)
         {
             return step
@@ -955,7 +980,7 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
-                checkpointAfter: checkpointAfter)
+                checkpointAfter: checkpointAfter, captureSink: captureSink)
             if let slot = tapSlots[i] {
                 capturedLayers?[slot] = hiddenStates
             }
@@ -1096,7 +1121,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let model: Qwen35TextModelInner
     let configuration: Qwen35TextConfiguration
 
-    @ModuleInfo(key: "lm_head") var lmHead: Linear?
+    /// Public for the same reason as ``Qwen35TextModelInner/embedTokens``: a
+    /// drafter scores its proposals with the target's own head. `nil` when the
+    /// checkpoint ties the head to the embeddings.
+    @ModuleInfo(key: "lm_head") public var lmHead: Linear?
 
     public init(_ args: Qwen35TextConfiguration) {
         self.configuration = args
@@ -1124,13 +1152,19 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
         let layerTaps = state?[mtpLayerTapIndicesKey]
+        // The sink is created per call and handed to the pass as an argument:
+        // the drafter path threads its per-round data through arguments and
+        // keeps nothing transient on the model instance.
+        let captureSink =
+            (state?[mtpGatedDeltaCaptureFlagKey] ?? false) ? GatedDeltaRoundCaptureSink() : nil
         var capturedLayers: [MLXArray]? = nil
         let hiddenStates: MLXArray
-        if emitDrafterState {
+        if emitDrafterState || captureSink != nil {
             let hidden = model.forward(
                 input.tokens, cache: cache, applyFinalNorm: false,
                 checkpointAfter: state?[mtpCacheCheckpointIndexKey],
-                layerTaps: layerTaps, capturedLayers: &capturedLayers)
+                layerTaps: layerTaps, capturedLayers: &capturedLayers,
+                captureSink: captureSink)
             hiddenStates = model.norm(hidden)
         } else {
             hiddenStates = model(input.tokens, cache: cache)
@@ -1143,11 +1177,19 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             logits = model.embedTokens.asLinear(hiddenStates)
         }
 
-        guard emitDrafterState else {
+        guard emitDrafterState || captureSink != nil else {
             return LMOutput(logits: logits)
         }
 
         var outState = state ?? LMOutput.State()
+        if let captureSink {
+            outState[mtpGatedDeltaCapturesKey] = captureSink.captures
+        }
+
+        guard emitDrafterState else {
+            return LMOutput(logits: logits, state: outState)
+        }
+
         outState[mtpLastHiddenStatesKey] = hiddenStates
         if let capturedLayers {
             outState[mtpLayerHiddenStatesKey] = capturedLayers
@@ -1260,7 +1302,9 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
-    @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
+    /// Public so a drafter paired with a MoE checkpoint can reach the text model it
+    /// actually speculates against; the wrapper only rearranges expert weights.
+    @ModuleInfo(key: "language_model") public var languageModel: Qwen35TextModel
 
     public init(_ args: Qwen35Configuration) {
         let textModel = Qwen35TextModel(args.textConfig)

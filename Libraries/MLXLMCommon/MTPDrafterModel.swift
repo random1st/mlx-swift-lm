@@ -315,6 +315,25 @@ public let mtpLayerTapIndicesKey =
 public let mtpLayerHiddenStatesKey =
     LMOutput.Key<[MLXArray]>("mtp.layerHiddenStates")
 
+/// Caller requests the target to stash every gated-DeltaNet layer's inputs to
+/// this forward pass, so a rejected tail can be rolled back afterwards.
+///
+/// ``mtpCacheCheckpointIndexKey`` splits the pass at one index chosen *before*
+/// it runs, which fits MTP-1 (one draft, so the split is always 1) and nothing
+/// wider: a block drafter learns its accept length only after the target has
+/// spoken. A capture defers the choice — the recurrence is replayed over
+/// whatever prefix turned out to be accepted. Absent or false means no stash,
+/// so the extra tensors only exist for callers that ask for them.
+public let mtpGatedDeltaCaptureFlagKey =
+    LMOutput.Key<Bool>("mtp.captureGatedDeltaRound")
+
+/// Target writes one ``GatedDeltaRoundCapture`` per recurrent layer here, in
+/// layer order, when ``mtpGatedDeltaCaptureFlagKey`` was set. Feed them to
+/// ``rollbackGatedDeltaRound(cache:captures:width:keep:)`` together with the
+/// accepted length.
+public let mtpGatedDeltaCapturesKey =
+    LMOutput.Key<[GatedDeltaRoundCapture]>("mtp.gatedDeltaCaptures")
+
 /// Requests a recurrent-cache checkpoint after this many verification input
 /// tokens. Hybrid Qwen models use `1` for MTP-1 so a rejected draft restores
 /// state after the always-committed bonus token without replaying the model.
