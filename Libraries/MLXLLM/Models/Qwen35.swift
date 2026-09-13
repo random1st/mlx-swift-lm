@@ -331,10 +331,22 @@ final class Qwen35GatedDeltaNet: Module {
         mask: MLXArray? = nil,
         cache: MambaCache? = nil,
         checkpointAfter: Int? = nil,
-        captureSink: GatedDeltaRoundCaptureSink? = nil
+        captureSink: GatedDeltaRoundCaptureSink? = nil,
+        tree: SpeculativeTreePlan? = nil
     ) -> MLXArray {
         let convState =
             cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
+        if let tree {
+            let (out, newConvState, newRecState) = forwardTree(
+                inputs, convState: convState, recState: cache?[1], plan: tree,
+                captureSink: captureSink)
+            if let cache {
+                cache[0] = newConvState
+                cache[1] = newRecState
+                cache.advance(inputs.dim(1))
+            }
+            return out
+        }
         let (out, newConvState, newRecState, checkpoint) = forward(
             inputs, convState: convState, recState: cache?[1], mask: mask,
             checkpointAfter: checkpointAfter, captureSink: captureSink)
@@ -478,6 +490,107 @@ final class Qwen35GatedDeltaNet: Module {
         return (outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint)
     }
 
+    /// The GDN body for a round whose rows form a tree.
+    ///
+    /// The recurrence has no mask that could express "row 5 continues row 1, not
+    /// row 4": a gated-delta state is an accumulation along one line of positions.
+    /// So the round is run once per root path, as a batch of `P` sequences, and
+    /// each row reads its output back from whichever path carried it. That is
+    /// well-defined because a row's ancestors in a tree are a single chain, so
+    /// every path containing the row computes the same thing for it.
+    ///
+    /// Both states this returns are provisional: they belong to whichever path
+    /// happened to be batch entry 0. Only ``rollbackGatedDeltaTree(cache:captures:width:keepRows:)``
+    /// knows which path the target accepted, and it overwrites them.
+    func forwardTree(
+        _ x: MLXArray,
+        convState: MLXArray,
+        recState: MLXArray?,
+        plan: SpeculativeTreePlan,
+        captureSink: GatedDeltaRoundCaptureSink?
+    ) -> (output: MLXArray, convState: MLXArray, recurrentState: MLXArray) {
+        let rows = x.dim(1)
+        precondition(x.dim(0) == 1, "a tree round verifies one sequence")
+        precondition(rows == plan.rowCount, "\(rows) rows against a plan for \(plan.rowCount)")
+
+        let (qkv, z, b, a) = projectInputs(x, batch: 1, sequence: rows)
+
+        let window = convKernelSize - 1
+        // Row order, `[1, window + rows, convDim]`: what the rollback replays the
+        // accepted path from, and what the path-major conv gathers its rows out of.
+        let convInput = concatenated([convState, qkv], axis: 1)
+
+        let paths = plan.pathCount
+        let length = plan.pathLength
+        let pathRows = plan.pathRowIndices().reshaped(paths * length)
+        let rowSources = plan.rowSourceIndices()
+
+        // Each path convolves over its own ancestors, so a branch never sees the
+        // sibling that happens to sit next to it in row order.
+        let pathConvInput = concatenated(
+            [
+                broadcast(convState, to: [paths, window, convDim]),
+                take(qkv[0], pathRows, axis: 0).reshaped(paths, length, convDim),
+            ], axis: 1)
+        let pathConv = conv1d(contiguous(pathConvInput))
+        let convPre = take(pathConv.reshaped(paths * length, convDim), rowSources, axis: 0)
+            .reshaped(1, rows, convDim)
+
+        let convOut = silu(convPre)
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+        let q = convSplit[0].reshaped(1, rows, numKHeads, headKDim)
+        let k = convSplit[1].reshaped(1, rows, numKHeads, headKDim)
+        let v = convSplit[2].reshaped(1, rows, numVHeads, headVDim)
+
+        let dtype = q.dtype
+        let invScale = pow(Float(headKDim), -0.5)
+        let qNormed =
+            MLXArray(pow(invScale, 2)).asType(dtype)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+        let kNormed =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        // The capture stays in row order: rollback picks the accepted path out of
+        // it, and which rows those are is not known until the target has spoken.
+        captureSink?.append(
+            GatedDeltaRoundCapture(
+                q: qNormed, k: kNormed, v: v, a: a, b: b,
+                aLog: aLog, dtBias: dtBias, state: recState, mask: nil,
+                convInput: convInput, convWindow: window))
+
+        func alongPaths(_ t: MLXArray) -> MLXArray {
+            let trailing = Array(t.shape.dropFirst(2))
+            return take(t[0], pathRows, axis: 0).reshaped([paths, length] + trailing)
+        }
+        // Shorter paths are padded by repeating the anchor row. Those slots
+        // recompute the anchor's update on top of a finished path; nothing reads
+        // them, because `rowSources` only ever points at a row's real slot.
+        let batchedState = recState.map {
+            contiguous(broadcast($0, to: [paths] + Array($0.shape.dropFirst())))
+        }
+        let (pathOut, pathState) = gatedDeltaUpdate(
+            q: alongPaths(qNormed),
+            k: alongPaths(kNormed),
+            v: alongPaths(v),
+            a: alongPaths(a),
+            b: alongPaths(b),
+            aLog: aLog,
+            dtBias: dtBias,
+            state: batchedState,
+            mask: nil)
+        let out = take(
+            pathOut.reshaped(paths * length, numVHeads, headVDim), rowSources, axis: 0
+        ).reshaped(1, rows, numVHeads, headVDim)
+
+        let gated = norm(out, gate: z)
+        return (
+            outProj(gated.reshaped(1, rows, -1)),
+            contiguous(convInput[0..., (-window)..., 0...]),
+            contiguous(pathState[..<1])
+        )
+    }
+
     /// The S == 1 depthwise conv as elementwise multiply-adds, so `compile`
     /// folds it into the surrounding segment. f32 accumulation with a single
     /// final round matches `generalConv`'s `Convolution` kernel bit-for-bit
@@ -567,13 +680,21 @@ final class Qwen35Attention: Module {
 
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
-        positionOffset: Int? = nil
+        positionOffset: Int? = nil,
+        rowPositions: MLXArray? = nil
     ) -> MLXArray {
         let (q, gate, k, values) = projectPreRope(x)
 
-        let offset = positionOffset.map(RoPEOffset.scalar) ?? cache?.ropeOffset
-        let queries = applyRotaryPosition(rope, to: q, offset: offset)
-        let keys = applyRotaryPosition(rope, to: k, offset: offset)
+        let queries: MLXArray
+        let keys: MLXArray
+        if let rowPositions {
+            queries = applyRowPositions(rope, to: q, positions: rowPositions)
+            keys = applyRowPositions(rope, to: k, positions: rowPositions)
+        } else {
+            let offset = positionOffset.map(RoPEOffset.scalar) ?? cache?.ropeOffset
+            queries = applyRotaryPosition(rope, to: q, offset: offset)
+            keys = applyRotaryPosition(rope, to: k, offset: offset)
+        }
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -607,6 +728,23 @@ final class Qwen35Attention: Module {
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
         return (queries, gate, keys, values)
+    }
+
+    /// Rope with a position per row rather than one running offset.
+    ///
+    /// Rows of a tree round are not consecutive: two siblings share a position.
+    /// RoPE takes an array offset per *batch* entry, so the rows move into the
+    /// batch dimension for the call and back out afterwards. Only a
+    /// single-sequence round does this, which is what a verify pass always is.
+    private func applyRowPositions(
+        _ rope: RoPELayer, to x: MLXArray, positions: MLXArray
+    ) -> MLXArray {
+        let heads = x.dim(1)
+        let rows = x.dim(2)
+        precondition(x.dim(0) == 1, "row positions assume one sequence in the batch")
+        let asBatch = x.transposed(0, 2, 1, 3).reshaped(rows, heads, 1, -1)
+        let roped = applyRotaryPosition(rope, to: asBatch, offset: .batch(positions))
+        return roped.reshaped(1, rows, heads, -1).transposed(0, 2, 1, 3)
     }
 
     /// Attention tail: head merge → output gate → output projection.
@@ -693,6 +831,16 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 
 // MARK: - Decoder Layer
 
+/// A tree-shaped verification round, resolved against the cache it writes into.
+///
+/// The plan is the shape; the positions are that shape placed at the cache's
+/// current offset, computed once per pass instead of once per layer.
+struct Qwen35TreeRound {
+    let plan: SpeculativeTreePlan
+    /// `[rows]` absolute position of every row, for rope.
+    let positions: MLXArray
+}
+
 final class Qwen35DecoderLayer: Module {
     let isLinear: Bool
 
@@ -742,13 +890,14 @@ final class Qwen35DecoderLayer: Module {
         cache: KVCache?,
         positionOffset: Int? = nil,
         checkpointAfter: Int? = nil,
-        captureSink: GatedDeltaRoundCaptureSink? = nil
+        captureSink: GatedDeltaRoundCaptureSink? = nil,
+        tree: Qwen35TreeRound? = nil
     ) -> MLXArray {
         // Single-token unmasked decode runs the layer as one traced function
         // (two for full attention, split at the KV write). Everything else —
         // including a capturing round, whose stash the trace cannot surface —
         // takes the general body below.
-        if x.dim(1) == 1, ssmMask == nil, captureSink == nil {
+        if x.dim(1) == 1, ssmMask == nil, captureSink == nil, tree == nil {
             if isLinear, let mambaCache = cache as? MambaCache {
                 return decodeLinearLayer(x, cache: mambaCache)
             }
@@ -761,11 +910,12 @@ final class Qwen35DecoderLayer: Module {
         if isLinear {
             r = linearAttn!(
                 inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
-                checkpointAfter: checkpointAfter, captureSink: captureSink)
+                checkpointAfter: checkpointAfter, captureSink: captureSink,
+                tree: tree?.plan)
         } else {
             r = selfAttn!(
                 inputLayerNorm(x), mask: attentionMask, cache: cache,
-                positionOffset: positionOffset)
+                positionOffset: positionOffset, rowPositions: tree?.positions)
         }
 
         let h = x + r
@@ -940,13 +1090,15 @@ public class Qwen35TextModelInner: Module {
         checkpointAfter: Int? = nil,
         layerTaps: [Int]? = nil,
         capturedLayers: inout [MLXArray]?,
-        captureSink: GatedDeltaRoundCaptureSink? = nil
+        captureSink: GatedDeltaRoundCaptureSink? = nil,
+        treePlan: SpeculativeTreePlan? = nil
     ) -> MLXArray {
         // The fused decode schedule runs the whole step as one graph and never
         // surfaces per-layer outputs or recurrence inputs, so a tap or capture
         // request has to take the general path. Single-token decode without
         // either is unaffected.
         if applyFinalNorm, inputs.dim(1) == 1, layerTaps?.isEmpty ?? true, captureSink == nil,
+            treePlan == nil,
             let caches = cache,
             let step = decodeStep(inputs, caches)
         {
@@ -960,8 +1112,23 @@ public class Qwen35TextModelInner: Module {
             cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
         }
 
-        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
-        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        // A tree round replaces both masks. Attention gets an explicit one -
+        // every row sees the committed prefix and its own ancestors, nothing
+        // else - and rows are positioned by depth rather than by order, so
+        // siblings share a position. The recurrent layers take no mask at all:
+        // they run per root path instead.
+        var tree: Qwen35TreeRound? = nil
+        var faMask: MLXFast.ScaledDotProductAttentionMaskMode
+        var ssmMask: MLXArray?
+        if let treePlan {
+            let offset = cacheArray?[faIdx]?.offset ?? 0
+            faMask = .array(treePlan.attentionMask(prefix: offset))
+            ssmMask = nil
+            tree = Qwen35TreeRound(plan: treePlan, positions: treePlan.positions(offset: offset))
+        } else {
+            faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
+            ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        }
 
         // Requested indices are resolved to positions once, so the loop stays a
         // dictionary lookup rather than a search per layer.
@@ -980,7 +1147,7 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i],
-                checkpointAfter: checkpointAfter, captureSink: captureSink)
+                checkpointAfter: checkpointAfter, captureSink: captureSink, tree: tree)
             if let slot = tapSlots[i] {
                 capturedLayers?[slot] = hiddenStates
             }
@@ -1159,12 +1326,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             (state?[mtpGatedDeltaCaptureFlagKey] ?? false) ? GatedDeltaRoundCaptureSink() : nil
         var capturedLayers: [MLXArray]? = nil
         let hiddenStates: MLXArray
-        if emitDrafterState || captureSink != nil {
+        let treePlan = state?[mtpTreePlanKey]
+        if emitDrafterState || captureSink != nil || treePlan != nil {
             let hidden = model.forward(
                 input.tokens, cache: cache, applyFinalNorm: false,
                 checkpointAfter: state?[mtpCacheCheckpointIndexKey],
                 layerTaps: layerTaps, capturedLayers: &capturedLayers,
-                captureSink: captureSink)
+                captureSink: captureSink, treePlan: treePlan)
             hiddenStates = model.norm(hidden)
         } else {
             hiddenStates = model(input.tokens, cache: cache)

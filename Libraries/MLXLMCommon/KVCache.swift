@@ -494,6 +494,34 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return trimmed
     }
 
+    /// Keep a chosen subset of the last speculative round's rows and drop the rest.
+    ///
+    /// ``trim(_:)`` is enough for a chain round, where the accepted tokens are a
+    /// prefix of what was written. A tree round accepts a path through the rows,
+    /// so the survivors are scattered: rows 0, 1, 4 of a 8-row round. Gathering
+    /// them back down to the front of the round is exact because a K/V row belongs
+    /// to its own position and nothing else - the rows were already written under
+    /// the tree's own attention mask, so no row's content depends on a sibling
+    /// that is being dropped.
+    ///
+    /// - Parameters:
+    ///   - rows: indices into the round, ascending, relative to its first row.
+    ///   - width: how many rows that round wrote.
+    public func keepSpeculativeRows(_ rows: [Int], width: Int) {
+        precondition(width <= offset, "round of \(width) rows is longer than the cache")
+        precondition(!rows.isEmpty && rows.count <= width, "keeping \(rows.count) of \(width) rows")
+        guard let keys = self.keys, let values = self.values else { return }
+
+        let base = offset - width
+        let source = MLXArray(rows.map { Int32(base + $0) })
+        let keptKeys = take(keys[.ellipsis, ..<offset, 0...], source, axis: 2)
+        let keptValues = take(values[.ellipsis, ..<offset, 0...], source, axis: 2)
+        let end = base + rows.count
+        self.keys?[.ellipsis, base ..< end, 0...] = keptKeys
+        self.values?[.ellipsis, base ..< end, 0...] = keptValues
+        offset = end
+    }
+
     /// Convert to a quantized cache for maximum efficiency.
     ///
     /// Use `updateQuantized()` and `quantizedScaledDotProductAttention()` for zero-overhead operation.
