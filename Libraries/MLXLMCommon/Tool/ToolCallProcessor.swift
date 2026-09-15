@@ -629,12 +629,19 @@ public class ToolCallProcessor {
 
                 let bufferedToolCall = toolCallBuffer
 
-                // Parse the tool call using the parser.
-                if let toolCall = parser.parse(content: bufferedToolCall, tools: tools) {
+                // Parse every call in the frame, not just the first. A pythonic frame is a
+                // list — `[a(x=1), b(y=2)]` — and `parse(content:)` is
+                // `parseMultiple(...).first` there, so all but one call was dropped
+                // silently: the model asked for two tools, the client got one, nothing was
+                // logged. `parseEOS` is the same parse without that truncation, and for the
+                // JSON and XML parsers it is the inherited default (split on `startTag`,
+                // parse each piece), so their single-call frames behave exactly as before.
+                let parsedCalls = parser.parseEOS(bufferedToolCall, tools: tools)
+                if !parsedCalls.isEmpty {
                     if !leadingTokenWasRecorded {
                         recordResponse(leadingToken ?? "")
                     }
-                    appendToolCall(toolCall, rawText: bufferedToolCall)
+                    appendToolCalls(parsedCalls, rawText: bufferedToolCall)
                     state = .normal
                     toolCallBuffer = ""
 

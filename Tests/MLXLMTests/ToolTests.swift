@@ -91,6 +91,27 @@ struct ToolTests {
         #expect(outputs[4] == .response("after"))
     }
 
+    @Test("LFM2 keeps every call in one completed frame")
+    func lfm2KeepsEveryCallInACompletedFrame() {
+        // A pythonic frame is a list, and a model asked for two things at once puts both in
+        // it. Taking only the first left the client one call and no diagnostic — the second
+        // tool simply never ran.
+        let processor = ToolCallProcessor(
+            format: .lfm2, tools: toolSchemas("list_files", "get_weather"))
+        let outputs = processor.processChunkOutputs(
+            "<|tool_call_start|>[list_files(path='src/api'), get_weather(city='Lisbon')]"
+                + "<|tool_call_end|>")
+
+        let calls = outputs.compactMap { output -> ToolCall? in
+            guard case .toolCall(let call) = output else { return nil }
+            return call
+        }
+        #expect(calls.count == 2)
+        guard calls.count == 2 else { return }
+        #expect(calls[0].function.name == "list_files")
+        #expect(calls[1].function.name == "get_weather")
+    }
+
     @Test("LFM2 EOS orders response before an unfinished second call")
     func lfm2EOSOrdersIncompleteSecondCall() {
         let processor = ToolCallProcessor(format: .lfm2, tools: toolSchemas("get_weather"))
